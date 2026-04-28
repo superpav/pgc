@@ -885,11 +885,8 @@ impl Dump {
         Ok(())
     }
 
-    async fn fetch_sequences_standalone(
-        pool: &PgPool,
-        schema_filter: &str,
-    ) -> Result<Vec<Sequence>, Error> {
-        let query = format!(
+    fn build_sequences_query(schema_filter: &str) -> String {
+        format!(
             "
             select
                 quote_ident(seq.schemaname) as schemaname,
@@ -915,7 +912,9 @@ impl Dump {
                 left join pg_namespace seq_ns on seq_ns.nspname = seq.schemaname
                 left join pg_class seq_class on seq_class.relname = seq.sequencename
                     and seq_class.relnamespace = seq_ns.oid
-                left join pg_description seq_desc on seq_desc.objoid = seq_class.oid and seq_desc.objsubid = 0
+                left join pg_description seq_desc on seq_desc.objoid = seq_class.oid and 
+                    seq_desc.objsubid = 0 and
+                    seq_desc.classoid = 'pg_class'::regclass
                 left join pg_depend dep on dep.objid = seq_class.oid
                     and dep.deptype in ('a', 'i')
                 left join pg_class owner_table on owner_table.oid = dep.refobjid
@@ -930,7 +929,14 @@ impl Dump {
                     and ext_dep.deptype = 'e'
                 )",
             schema_filter
-        );
+        )
+    }
+
+    async fn fetch_sequences_standalone(
+        pool: &PgPool,
+        schema_filter: &str,
+    ) -> Result<Vec<Sequence>, Error> {
+        let query = Self::build_sequences_query(schema_filter);
 
         let rows = sqlx::query(query.as_str())
             .fetch_all(pool)
@@ -1202,30 +1208,8 @@ impl Dump {
         Ok(routines)
     }
 
-    /// Fetch all tables with bounded-parallel fills.
-    ///
-    /// Fetch every table in the accessible schemas, then fill per-table
-    /// metadata (columns, indexes, constraints, triggers, policies,
-    /// partitioning info, definitions) via schema-wide bulk queries rather
-    /// than a per-table fan-out.
-    async fn fetch_tables_standalone(
-        pool: &PgPool,
-        schema_filter: &str,
-        pg_version: i32,
-    ) -> Result<Vec<Table>, Error> {
-        // Check once whether the pg_get_tabledef extension function exists.
-        let has_tabledef_fn =
-            sqlx::query("select proname from pg_proc where proname = 'pg_get_tabledef';")
-                .fetch_optional(pool)
-                .await
-                .unwrap_or(None)
-                .is_some();
-
-        // `pg_version` is fetched once in `Dump::fill` and passed in here.
-        // Probe catalog capabilities once for the entire dump run.
-        let caps = PgCatalogCaps::detect(pool, pg_version).await;
-
-        let query = format!(
+    fn build_tables_query(schema_filter: &str) -> String {
+        format!(
             "
                 select
                     quote_ident(t.schemaname) as schemaname,
@@ -1262,10 +1246,12 @@ impl Dump {
                     and c.relkind in ('r','p')
                     and c.relnamespace = (select oid from pg_namespace where nspname = t.schemaname)
                 left join pg_am am on am.oid = c.relam
-                left join pg_description d on d.objoid = c.oid and d.objsubid = 0
-                where 
-                    t.schemaname not in ('pg_catalog', 'information_schema') 
-                    and t.schemaname in {} 
+                left join pg_description d on d.objoid = c.oid and
+                    d.objsubid = 0 and
+                    d.classoid = 'pg_class'::regclass
+                where
+                    t.schemaname not in ('pg_catalog', 'information_schema')
+                    and t.schemaname in {}
                     and t.tablename not like 'pg_%'
                     and not exists (
                         select 1 from pg_depend ext_dep
@@ -1273,7 +1259,33 @@ impl Dump {
                         and ext_dep.deptype = 'e'
                     );",
             schema_filter
-        );
+        )
+    }
+
+    /// Fetch all tables with bounded-parallel fills.
+    ///
+    /// Fetch every table in the accessible schemas, then fill per-table
+    /// metadata (columns, indexes, constraints, triggers, policies,
+    /// partitioning info, definitions) via schema-wide bulk queries rather
+    /// than a per-table fan-out.
+    async fn fetch_tables_standalone(
+        pool: &PgPool,
+        schema_filter: &str,
+        pg_version: i32,
+    ) -> Result<Vec<Table>, Error> {
+        // Check once whether the pg_get_tabledef extension function exists.
+        let has_tabledef_fn =
+            sqlx::query("select proname from pg_proc where proname = 'pg_get_tabledef';")
+                .fetch_optional(pool)
+                .await
+                .unwrap_or(None)
+                .is_some();
+
+        // `pg_version` is fetched once in `Dump::fill` and passed in here.
+        // Probe catalog capabilities once for the entire dump run.
+        let caps = PgCatalogCaps::detect(pool, pg_version).await;
+
+        let query = Self::build_tables_query(schema_filter);
 
         let rows = sqlx::query(query.as_str())
             .fetch_all(pool)
@@ -1370,13 +1382,28 @@ impl Dump {
         Ok(shell_tables)
     }
 
-    async fn fetch_views_standalone(
-        pool: &PgPool,
-        schema_filter: &str,
-    ) -> Result<Vec<View>, Error> {
-        // Fetch regular and materialized views concurrently.
-        let regular_query = format!(
-            "select 
+    fn build_view_col_comments_query(schema_filter: &str) -> String {
+        format!(
+            "select
+                quote_ident(n.nspname) as schema_name,
+                quote_ident(c.relname) as view_name,
+                quote_ident(a.attname) as column_name,
+                d.description as col_comment
+            from pg_class c
+            join pg_namespace n on n.oid = c.relnamespace
+            join pg_attribute a on a.attrelid = c.oid and a.attnum > 0 and not a.attisdropped
+            join pg_description d on d.objoid = c.oid and d.classoid = 'pg_class'::regclass and d.objsubid = a.attnum
+            where c.relkind in ('v', 'm')
+                and n.nspname not in ('pg_catalog', 'information_schema')
+                and n.nspname in {}
+            order by n.nspname, c.relname, a.attnum;",
+            schema_filter
+        )
+    }
+
+    fn build_regular_views_query(schema_filter: &str) -> String {
+        format!(
+            "select
                     quote_ident(v.table_schema) as table_schema,
                     quote_ident(v.table_name) as table_name,
                     v.view_definition,
@@ -1390,7 +1417,9 @@ impl Dump {
             join information_schema.view_table_usage vtu on v.table_name = vtu.view_name and v.table_schema = vtu.view_schema
             left join pg_views pv on pv.schemaname = v.table_schema and pv.viewname = v.table_name
             left join pg_class c on c.relname = v.table_name and c.relnamespace = (select oid from pg_namespace where nspname = v.table_schema)
-            left join pg_description d on d.objoid = c.oid and d.objsubid = 0
+            left join pg_description d on d.objoid = c.oid and
+                d.objsubid = 0 and
+                d.classoid = 'pg_class'::regclass
             where
                 v.table_schema not in ('pg_catalog', 'information_schema')
                 and v.table_schema in {}
@@ -1401,9 +1430,11 @@ impl Dump {
                 )
             group by v.table_schema, v.table_name, v.view_definition, pv.viewowner, d.description, c.oid, c.reloptions, v.check_option;",
             schema_filter
-        );
+        )
+    }
 
-        let mat_query = format!(
+    fn build_mat_views_query(schema_filter: &str) -> String {
+        format!(
             "select
                     mv.schemaname as table_schema,
                     mv.matviewname as table_name,
@@ -1425,7 +1456,9 @@ impl Dump {
             from pg_matviews mv
             join pg_class c on c.relname = mv.matviewname
                 and c.relnamespace = (select oid from pg_namespace where nspname = mv.schemaname)
-            left join pg_description d on d.objoid = c.oid and d.objsubid = 0
+            left join pg_description d on d.objoid = c.oid and
+                d.objsubid = 0 and
+                d.classoid = 'pg_class'::regclass
             where mv.schemaname not in ('pg_catalog', 'information_schema')
                 and mv.schemaname in {}
                 and not exists (
@@ -1434,25 +1467,19 @@ impl Dump {
                     and ext_dep.deptype = 'e'
                 );",
             schema_filter
-        );
+        )
+    }
+
+    async fn fetch_views_standalone(
+        pool: &PgPool,
+        schema_filter: &str,
+    ) -> Result<Vec<View>, Error> {
+        // Fetch regular and materialized views concurrently.
+        let regular_query = Self::build_regular_views_query(schema_filter);
+        let mat_query = Self::build_mat_views_query(schema_filter);
 
         // Column comments query (works for both regular and materialized views)
-        let col_comments_query = format!(
-            "select
-                quote_ident(n.nspname) as schema_name,
-                quote_ident(c.relname) as view_name,
-                quote_ident(a.attname) as column_name,
-                d.description as col_comment
-            from pg_class c
-            join pg_namespace n on n.oid = c.relnamespace
-            join pg_attribute a on a.attrelid = c.oid and a.attnum > 0 and not a.attisdropped
-            join pg_description d on d.objoid = c.oid and d.objsubid = a.attnum
-            where c.relkind in ('v', 'm')
-                and n.nspname not in ('pg_catalog', 'information_schema')
-                and n.nspname in {}
-            order by n.nspname, c.relname, a.attnum;",
-            schema_filter
-        );
+        let col_comments_query = Self::build_view_col_comments_query(schema_filter);
 
         let (regular_rows, mat_rows, col_comment_rows) = tokio::try_join!(
             async {
@@ -3762,6 +3789,56 @@ mod tests {
         assert!(
             reg_a_pos < reg_b_pos,
             "regular_a before regular_b alphabetically"
+        );
+    }
+
+    #[test]
+    fn fetch_view_col_comments_query_filters_pg_description_by_classoid() {
+        let query = Dump::build_view_col_comments_query("('public')");
+
+        assert!(
+            query.contains("d.classoid = 'pg_class'::regclass"),
+            "pg_description join on view column comments must filter by classoid to avoid OID collisions across catalogs: {query}"
+        );
+    }
+
+    #[test]
+    fn fetch_sequences_query_filters_pg_description_by_classoid() {
+        let query = Dump::build_sequences_query("('public')");
+
+        assert!(
+            query.contains("seq_desc.classoid = 'pg_class'::regclass"),
+            "pg_description join on sequences must filter by classoid to avoid OID collisions across catalogs: {query}"
+        );
+    }
+
+    #[test]
+    fn fetch_tables_query_filters_pg_description_by_classoid() {
+        let query = Dump::build_tables_query("('public')");
+
+        assert!(
+            query.contains("d.classoid = 'pg_class'::regclass"),
+            "pg_description join on tables must filter by classoid to avoid OID collisions across catalogs: {query}"
+        );
+    }
+
+    #[test]
+    fn fetch_regular_views_query_filters_pg_description_by_classoid() {
+        let query = Dump::build_regular_views_query("('public')");
+
+        assert!(
+            query.contains("d.classoid = 'pg_class'::regclass"),
+            "pg_description join on regular views must filter by classoid to avoid OID collisions across catalogs: {query}"
+        );
+    }
+
+    #[test]
+    fn fetch_mat_views_query_filters_pg_description_by_classoid() {
+        let query = Dump::build_mat_views_query("('public')");
+
+        assert!(
+            query.contains("d.classoid = 'pg_class'::regclass"),
+            "pg_description join on materialized views must filter by classoid to avoid OID collisions across catalogs: {query}"
         );
     }
 }

@@ -421,6 +421,7 @@ impl Table {
                             AND a.attisdropped = false
                          LEFT JOIN pg_description pd
                              ON pd.objoid = cls.oid
+                            AND pd.classoid = 'pg_class'::regclass
                             AND pd.objsubid = a.attnum
                         WHERE c.table_schema IN {schema_filter}
                         ORDER BY c.table_schema, c.table_name, c.ordinal_position"
@@ -541,11 +542,8 @@ impl Table {
     }
 
     /// Fetch indexes for every table in the accessible schemas in one query.
-    async fn fetch_indexes_bulk(
-        pool: &PgPool,
-        schema_filter: &str,
-    ) -> Result<HashMap<(String, String), Vec<TableIndex>>, Error> {
-        let query = format!(
+    fn build_indexes_query(schema_filter: &str) -> String {
+        format!(
                         "SELECT
                                 quote_ident(i.schemaname) as schemaname,
                                 quote_ident(i.tablename) as tablename,
@@ -561,13 +559,20 @@ impl Table {
                          JOIN pg_namespace n ON n.oid = ic.relnamespace AND n.nspname = i.schemaname
                          JOIN pg_index idx ON idx.indexrelid = ic.oid
                          LEFT JOIN pg_constraint puc ON puc.conindid = ic.oid AND puc.contype IN ('p', 'u')
-                         LEFT JOIN pg_description d ON d.objoid = ic.oid AND d.objsubid = 0
+                         LEFT JOIN pg_description d ON d.objoid = ic.oid AND d.classoid = 'pg_class'::regclass AND d.objsubid = 0
                          WHERE idx.indisprimary = false
                              AND (idx.indisunique = false OR puc.oid IS NULL)
                              AND NOT EXISTS (SELECT 1 FROM pg_constraint xc WHERE xc.conindid = ic.oid AND xc.contype = 'x')
                              AND i.schemaname IN {schema_filter}
                          ORDER BY i.schemaname, i.tablename, i.indexname"
-                );
+                )
+    }
+
+    async fn fetch_indexes_bulk(
+        pool: &PgPool,
+        schema_filter: &str,
+    ) -> Result<HashMap<(String, String), Vec<TableIndex>>, Error> {
+        let query = Self::build_indexes_query(schema_filter);
         let rows = sqlx::query(&query).fetch_all(pool).await?;
 
         let mut indexes_by_key: HashMap<(String, String), Vec<TableIndex>> = HashMap::new();
@@ -4510,6 +4515,26 @@ mod tests {
         assert!(
             query.contains("a.attstattarget::int4"),
             "expected ::int4 cast for attstattarget"
+        );
+    }
+
+    #[test]
+    fn fetch_columns_query_filters_pg_description_by_classoid() {
+        let query = Table::build_columns_query("", "('public')");
+
+        assert!(
+            query.contains("pd.classoid = 'pg_class'::regclass"),
+            "pg_description join on columns must filter by classoid to avoid OID collisions across catalogs: {query}"
+        );
+    }
+
+    #[test]
+    fn fetch_indexes_query_filters_pg_description_by_classoid() {
+        let query = Table::build_indexes_query("('public')");
+
+        assert!(
+            query.contains("d.classoid = 'pg_class'::regclass"),
+            "pg_description join on indexes must filter by classoid to avoid OID collisions across catalogs: {query}"
         );
     }
 }
